@@ -1,0 +1,10 @@
+LIBRARY MDViewer
+EXPORTS
+    ListGetDetectString
+    ListLoad
+    ListLoadW
+    ListCloseWindow
+    ListSearchText
+    ListSearchTextW
+    ListSendCommand
+    ListSetDefaultParams

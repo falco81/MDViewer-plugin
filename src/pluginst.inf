@@ -1,0 +1,7 @@
+[plugininstall]
+type=wlx
+file=MDViewer.wlx
+file64=MDViewer.wlx64
+description=Markdown viewer plugin (renders .md files in Lister with search)
+defaultdir=MDViewer
+detectstring=EXT="MD" | EXT="MARKDOWN" | EXT="MKD" | EXT="MDOWN" | EXT="MDX"
