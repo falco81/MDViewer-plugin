@@ -76,6 +76,13 @@ static const wchar_t* kZoomBarClass   = L"MDViewerZoomBar";
 
 static HMODULE g_hInstance = nullptr;
 
+// INI path supplied by TC via ListSetDefaultParams. TC points us at a
+// user-writable file (typically %APPDATA%\GHISLER\... or wherever
+// wincmd.ini lives). When this is empty we fall back to writing next
+// to the DLL, which works for portable TC installs but fails on
+// standard installs in Program Files due to UAC.
+static std::wstring g_iniPathFromTC;
+
 // IDs for child controls
 enum {
     ID_EDIT  = 1001,
@@ -114,11 +121,30 @@ static void PositionZoomWidget(PluginInst* p);
 static std::wstring GetIniPath();
 static void LoadWindowPlacement(HWND hwnd);
 static void SaveWindowPlacement(HWND hwnd);
+static HWND  ListerTopLevel(HWND hostWnd);
 
 // ---------------------------------------------------------------------------
-// INI persistence (window placement next to the DLL)
+// INI persistence — prefer TC's user-writable data dir, fall back to
+// the DLL's own dir for portable installs.
 // ---------------------------------------------------------------------------
 static std::wstring GetIniPath() {
+    // 1) TC supplied an INI path via ListSetDefaultParams. That points
+    //    at TC's main wincmd.ini in a user-writable location (typically
+    //    %APPDATA%\GHISLER\). We write our own MDViewer.ini next to it
+    //    rather than polluting wincmd.ini.
+    if (!g_iniPathFromTC.empty()) {
+        std::wstring s = g_iniPathFromTC;
+        size_t a = s.find_last_of(L"\\/");
+        if (a != std::wstring::npos) s = s.substr(0, a + 1);
+        else s.clear();
+        s += L"MDViewer.ini";
+        return s;
+    }
+    // 2) Fallback: write next to the DLL. This works for portable TC
+    //    installs where the user has write access to the install dir.
+    //    On standard installs in Program Files, this will silently
+    //    fail under UAC — but TC normally calls ListSetDefaultParams
+    //    so we shouldn't hit this path in practice.
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(g_hInstance, path, MAX_PATH);
     std::wstring s = path;
@@ -126,6 +152,18 @@ static std::wstring GetIniPath() {
     if (a != std::wstring::npos) s = s.substr(0, a + 1);
     s += L"MDViewer.ini";
     return s;
+}
+
+// Find the actual top-level Lister window. The HWND passed to
+// ListLoad is the inner Lister content pane — its parent chain leads
+// to the Lister window proper, which is what holds the placement we
+// need to remember. SetWindowPlacement on the inner pane has no
+// visible effect because that pane is a child anchored by its
+// container.
+static HWND ListerTopLevel(HWND hostWnd) {
+    if (!hostWnd) return nullptr;
+    HWND root = GetAncestor(hostWnd, GA_ROOT);
+    return root ? root : hostWnd;
 }
 
 static void LoadWindowPlacement(HWND hwnd) {
@@ -880,7 +918,8 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 KillTimer(hwnd, 2);
                 if (p->parentList && !p->placementApplied) {
                     p->placementApplied = true;
-                    LoadWindowPlacement(p->parentList);
+                    HWND root = ListerTopLevel(p->parentList);
+                    LoadWindowPlacement(root ? root : p->parentList);
                 }
                 return 0;
             }
@@ -1103,7 +1142,8 @@ static HWND DoLoad(HWND parent, const std::wstring& path) {
         if (GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES) {
             int m = GetPrivateProfileIntW(L"Window", L"Maximized", -1, ini.c_str());
             if (m == 1) {
-                LoadWindowPlacement(parent);
+                HWND root = ListerTopLevel(parent);
+                LoadWindowPlacement(root ? root : parent);
                 p->placementApplied = true;
             } else if (m == 0) {
                 wantNormal = true;
@@ -1140,8 +1180,13 @@ __declspec(dllexport)
 void __stdcall ListCloseWindow(HWND ListWin) {
     if (!ListWin) return;
     PluginInst* p = (PluginInst*)GetWindowLongPtrW(ListWin, GWLP_USERDATA);
-    // Persist Lister window placement before tearing down.
-    if (p && p->parentList) SaveWindowPlacement(p->parentList);
+    // Persist the actual top-level Lister window's placement before
+    // tearing down. parentList is the inner pane — walk up to the
+    // root so we capture the size/position the user actually sees.
+    if (p && p->parentList) {
+        HWND root = ListerTopLevel(p->parentList);
+        SaveWindowPlacement(root ? root : p->parentList);
+    }
     KillTimer(ListWin, 1);
     DestroyWindow(ListWin);
     delete p;
@@ -1211,8 +1256,24 @@ int __stdcall ListSendCommand(HWND ListWin, int Command, int /*Parameter*/) {
 }
 
 __declspec(dllexport)
-void __stdcall ListSetDefaultParams(ListDefaultParamStruct* /*dps*/) {
-    // nothing to do
+void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
+    // TC calls this once at plugin load with a path to the INI file
+    // we should use. That path lives in TC's user-writable data dir
+    // (%APPDATA%\GHISLER\ on standard installs) — much better than
+    // writing next to the DLL, which sits in Program Files and gets
+    // blocked by UAC for non-admin users.
+    if (!dps || dps->size < (int)sizeof(int) * 4) return;
+    if (dps->DefaultIniName[0]) {
+        // ANSI -> wide.
+        int n = MultiByteToWideChar(CP_ACP, 0, dps->DefaultIniName,
+                                    -1, nullptr, 0);
+        if (n > 0) {
+            std::wstring s(n - 1, L'\0');
+            MultiByteToWideChar(CP_ACP, 0, dps->DefaultIniName,
+                                -1, s.data(), n);
+            g_iniPathFromTC = std::move(s);
+        }
+    }
 }
 
 } // extern "C"
