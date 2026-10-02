@@ -131,7 +131,9 @@ public:
 
     // ------ Selection ----------------------------------------------------
     // Hit-test (x, yDoc) and return (opIndex, charOffset). Returns false
-    // if not over any text run.
+    // only when the document contains no text at all; otherwise it always
+    // snaps to the nearest text run, so a click in whitespace between
+    // paragraphs still produces a usable caret position.
     bool HitTestText(int x, int yDoc, int* outOpIndex, int* outCharOffset) const;
 
     // Set the selection range. Both ends are (opIndex, charOffset).
@@ -140,6 +142,23 @@ public:
     void ClearSelection();
     bool HasSelection() const;
     std::wstring GetSelectionText() const;
+
+    // Select the whole document, from the first text op to the end of
+    // the last text op. Clears the selection and returns false if the
+    // document has no text at all.
+    bool SelectAll();
+
+    // Expand (opIndex, charOffset) to the surrounding word, writing the
+    // start/end back to the given ends. Used by double-click selection.
+    void ExpandToWord(int opIndex, int charOffset,
+                      int* outStartOp, int* outStartChar,
+                      int* outEndOp,   int* outEndChar) const;
+
+    // Expand (opIndex, charOffset) to the whole visual line (all ops
+    // sharing the same y). Used by triple-click selection.
+    void ExpandToLine(int opIndex,
+                      int* outStartOp, int* outStartChar,
+                      int* outEndOp,   int* outEndChar) const;
     // True if any selection is currently being painted.
     bool HasSelectionAtPaint() const { return selA_op_ >= 0 && selB_op_ >= 0
                                               && !(selA_op_ == selB_op_ && selA_char_ == selB_char_); }

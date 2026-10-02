@@ -29,13 +29,13 @@
 #include <cstring>
 
 // The D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT flag was added in the
-// Windows 8.1 SDK. AlmaLinux 8's mingw-w64 7.2 still ships pre-8.1
-// headers, so we fall back to the documented numeric value when the
-// symbol is missing. The bit is silently ignored on older Windows
-// versions, so this is a header-only fix.
+// Windows 8.1 SDK. Older MinGW-w64 ships pre-8.1 headers so the
+// symbolic name is missing. The bit is silently ignored on pre-8.1
+// Windows, so we always use static_cast to the enum type regardless
+// of whether the symbol was defined by d2d1.h.
 #ifndef D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
-#define D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT \
-    static_cast<D2D1_DRAW_TEXT_OPTIONS>(0x00000004)
+#  define D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT \
+       static_cast<D2D1_DRAW_TEXT_OPTIONS>(0x00000004)
 #endif
 
 #ifdef _MSC_VER
@@ -1858,6 +1858,23 @@ void Renderer::Paint(HDC hdc, int scrollY, int clientW, int clientH) {
         }
     }
 
+    // Pass 2a2: inline-code (and other per-run) backgrounds.
+    // Previously these were drawn in Pass 3, which runs AFTER the
+    // selection highlight — the inline-code grey bg then covered the
+    // selection and `code` spans looked unselected. Drawing them here
+    // lets Pass 2b's highlight sit on top where it belongs.
+    for (const DrawOp& op : ops_) {
+        if (op.kind != D_TEXT) continue;
+        if (op.bg == NO_BG) continue;
+        if (op.y + op.h < yMin) continue;
+        if (op.y > yMax) break;
+        HBRUSH br = CreateSolidBrush(op.bg);
+        POINT p = docToClient(op.x - 2, op.y);
+        RECT r = { p.x, p.y, p.x + op.w + 4, p.y + op.h };
+        FillRect(hdc, &r, br);
+        DeleteObject(br);
+    }
+
     // Pass 2b: selection highlight (under text, over backgrounds).
     if (HasSelectionAtPaint()) {
         for (int i = selA_op_; i <= selB_op_ && i < (int)ops_.size(); ++i) {
@@ -1892,13 +1909,9 @@ void Renderer::Paint(HDC hdc, int scrollY, int clientW, int clientH) {
         if (op.y + op.h < yMin) continue;
         if (op.y > yMax) break;
 
-        if (op.bg != NO_BG) {
-            HBRUSH br = CreateSolidBrush(op.bg);
-            POINT p = docToClient(op.x - 2, op.y);
-            RECT r = { p.x, p.y, p.x + op.w + 4, p.y + op.h };
-            FillRect(hdc, &r, br);
-            DeleteObject(br);
-        }
+        // (Per-run background was drawn in Pass 2a2, so the
+        // selection highlight from Pass 2b can sit on top of it
+        // without being over-painted.)
 
         POINT p = docToClient(op.x, op.y);
         DrawTextRun(graphics, gpFonts_[op.font], op.text, p.x, p.y, op.color);
@@ -2084,53 +2097,53 @@ bool Renderer::FindAnchor(const std::wstring& anchorId, int* outY) const {
 // ---------- Selection ------------------------------------------------------
 
 bool Renderer::HitTestText(int x, int yDoc, int* outOpIndex, int* outCharOffset) const {
-    // First, find an op whose Y range contains yDoc. Pick the closest in X.
+    // Walk every text op and score it. The chosen op is the one whose
+    // bounding box has the smallest (verticalGap, horizontalGap) tuple.
+    // Vertical gap wins first; horizontal gap breaks ties. This means a
+    // click anywhere — inside a run, between runs on the same line,
+    // between paragraphs, or below the last line — always lands on a
+    // real text op, so dragging a selection never falls into "dead
+    // zones" where the hit-test returns false and the selection stops
+    // tracking the mouse.
     int bestIdx = -1;
-    int bestDx  = INT_MAX;
-    int bestY   = INT_MAX;
+    long long bestScore = LLONG_MAX;
     for (size_t i = 0; i < ops_.size(); ++i) {
         const DrawOp& op = ops_[i];
         if (op.kind != D_TEXT) continue;
-        if (yDoc < op.y || yDoc >= op.y + op.h) continue;
-        int dx = 0;
-        if (x < op.x)             dx = op.x - x;
-        else if (x > op.x + op.w) dx = x - (op.x + op.w);
-        if (dx < bestDx || (dx == bestDx && op.y < bestY)) {
-            bestDx = dx;
-            bestIdx = (int)i;
-            bestY = op.y;
+        int vgap;
+        if (yDoc < op.y)             vgap = op.y - yDoc;
+        else if (yDoc >= op.y + op.h) vgap = yDoc - (op.y + op.h - 1);
+        else                          vgap = 0;
+        int hgap;
+        if (x < op.x)             hgap = op.x - x;
+        else if (x > op.x + op.w) hgap = x - (op.x + op.w);
+        else                      hgap = 0;
+        // Pack (vgap, hgap, y) into one score — low vgap wins first,
+        // then low hgap, then earlier y to pick the top-most of
+        // equally-close ops.
+        long long score = ((long long)vgap << 40)
+                        | ((long long)hgap << 20)
+                        | ((long long)(op.y & 0xFFFFF));
+        if (score < bestScore) {
+            bestScore = score;
+            bestIdx   = (int)i;
         }
     }
-    if (bestIdx < 0) {
-        // Find closest by Y instead — clamp to nearest line.
-        int bestVDist = INT_MAX;
-        for (size_t i = 0; i < ops_.size(); ++i) {
-            const DrawOp& op = ops_[i];
-            if (op.kind != D_TEXT) continue;
-            int vdist = 0;
-            if (yDoc < op.y) vdist = op.y - yDoc;
-            else if (yDoc > op.y + op.h) vdist = yDoc - (op.y + op.h);
-            if (vdist < bestVDist) {
-                bestVDist = vdist;
-                bestIdx = (int)i;
-            }
-        }
-        if (bestIdx < 0) return false;
-    }
+    if (bestIdx < 0) return false;    // document has no text at all
+
     const DrawOp& op = ops_[bestIdx];
-    // Find char offset by binary searching widths
     int relX = x - op.x;
     if (relX <= 0) {
-        if (outOpIndex) *outOpIndex = bestIdx;
+        if (outOpIndex)    *outOpIndex    = bestIdx;
         if (outCharOffset) *outCharOffset = 0;
         return true;
     }
     if (relX >= op.w) {
-        if (outOpIndex) *outOpIndex = bestIdx;
+        if (outOpIndex)    *outOpIndex    = bestIdx;
         if (outCharOffset) *outCharOffset = (int)op.text.size();
         return true;
     }
-    // Linear scan through text -- typical lines are short.
+    // Binary search for character offset within the run.
     HDC hdc = GetDC(nullptr);
     Gdiplus::Graphics g(hdc);
     int lo = 0, hi = (int)op.text.size();
@@ -2140,12 +2153,11 @@ bool Renderer::HitTestText(int x, int yDoc, int* outOpIndex, int* outCharOffset)
         if (w <= relX) lo = mid;
         else           hi = mid;
     }
-    // Choose between lo and hi based on which is closer
     int wLo = MeasureRunWidth(g, gpFonts_[op.font], op.text.substr(0, lo));
     int wHi = MeasureRunWidth(g, gpFonts_[op.font], op.text.substr(0, hi));
     int chosen = (relX - wLo < wHi - relX) ? lo : hi;
     ReleaseDC(nullptr, hdc);
-    if (outOpIndex) *outOpIndex = bestIdx;
+    if (outOpIndex)    *outOpIndex    = bestIdx;
     if (outCharOffset) *outCharOffset = chosen;
     return true;
 }
@@ -2183,7 +2195,10 @@ std::wstring Renderer::GetSelectionText() const {
     if (!HasSelection()) return L"";
     std::wstring out;
     int lastY = INT_MIN;
-    for (int i = selA_op_; i <= selB_op_ && i < (int)ops_.size(); ++i) {
+    int endOp = selB_op_;
+    if (endOp >= (int)ops_.size()) endOp = (int)ops_.size() - 1;
+    int startOp = selA_op_ < 0 ? 0 : selA_op_;
+    for (int i = startOp; i <= endOp; ++i) {
         if (ops_[i].kind != D_TEXT) continue;
         const DrawOp& op = ops_[i];
         // Insert newline when Y advances to a new line.
@@ -2196,6 +2211,99 @@ std::wstring Renderer::GetSelectionText() const {
         if (to > from) out += op.text.substr(from, to - from);
     }
     return out;
+}
+
+bool Renderer::SelectAll() {
+    // Walk the ops to find the first and last text op (we skip non-text
+    // ops like images and rules). This avoids the previous "sentinel
+    // INT_MAX" approach that only worked by accident.
+    int firstOp = -1, lastOp = -1;
+    for (size_t i = 0; i < ops_.size(); ++i) {
+        if (ops_[i].kind == D_TEXT) {
+            if (firstOp < 0) firstOp = (int)i;
+            lastOp = (int)i;
+        }
+    }
+    if (firstOp < 0) { ClearSelection(); return false; }
+    SetSelection(firstOp, 0,
+                 lastOp, (int)ops_[lastOp].text.size());
+    return true;
+}
+
+// Simple word-break: a word character is a letter, a digit, or '_'.
+// Everything else is a boundary. Unicode letters above U+00FF get a
+// conservative treatment (treated as word chars) so CJK blocks also
+// double-click-select something useful.
+static bool IsWordChar(wchar_t c) {
+    if (c == L'_')                     return true;
+    if (c >= L'0' && c <= L'9')        return true;
+    if (c >= L'A' && c <= L'Z')        return true;
+    if (c >= L'a' && c <= L'z')        return true;
+    if (c >= 0x00C0 && c != 0x00D7 && c != 0x00F7) return true;
+    return false;
+}
+
+void Renderer::ExpandToWord(int opIndex, int charOffset,
+                            int* outStartOp, int* outStartChar,
+                            int* outEndOp,   int* outEndChar) const {
+    if (opIndex < 0 || opIndex >= (int)ops_.size()
+        || ops_[opIndex].kind != D_TEXT) {
+        if (outStartOp)   *outStartOp   = opIndex;
+        if (outStartChar) *outStartChar = charOffset;
+        if (outEndOp)     *outEndOp     = opIndex;
+        if (outEndChar)   *outEndChar   = charOffset;
+        return;
+    }
+    const std::wstring& t = ops_[opIndex].text;
+    if (t.empty()) {
+        if (outStartOp)   *outStartOp   = opIndex;
+        if (outStartChar) *outStartChar = 0;
+        if (outEndOp)     *outEndOp     = opIndex;
+        if (outEndChar)   *outEndChar   = 0;
+        return;
+    }
+    int c = charOffset;
+    if (c < 0) c = 0;
+    if (c > (int)t.size()) c = (int)t.size();
+    // If the cursor sits at the end of the run, step back one char.
+    int probe = c < (int)t.size() ? c : (int)t.size() - 1;
+    if (!IsWordChar(t[probe])) {
+        // Not on a word — select the single character under the caret.
+        if (outStartOp)   *outStartOp   = opIndex;
+        if (outStartChar) *outStartChar = probe;
+        if (outEndOp)     *outEndOp     = opIndex;
+        if (outEndChar)   *outEndChar   = probe + 1;
+        return;
+    }
+    int s = probe;
+    while (s > 0 && IsWordChar(t[s - 1])) --s;
+    int e = probe;
+    while (e < (int)t.size() && IsWordChar(t[e])) ++e;
+    if (outStartOp)   *outStartOp   = opIndex;
+    if (outStartChar) *outStartChar = s;
+    if (outEndOp)     *outEndOp     = opIndex;
+    if (outEndChar)   *outEndChar   = e;
+}
+
+void Renderer::ExpandToLine(int opIndex,
+                            int* outStartOp, int* outStartChar,
+                            int* outEndOp,   int* outEndChar) const {
+    if (opIndex < 0 || opIndex >= (int)ops_.size()) {
+        if (outStartOp)   *outStartOp   = opIndex;
+        if (outStartChar) *outStartChar = 0;
+        if (outEndOp)     *outEndOp     = opIndex;
+        if (outEndChar)   *outEndChar   = 0;
+        return;
+    }
+    int y = ops_[opIndex].y;
+    int s = opIndex, e = opIndex;
+    while (s > 0 && ops_[s - 1].kind == D_TEXT && ops_[s - 1].y == y) --s;
+    while (e + 1 < (int)ops_.size() && ops_[e + 1].kind == D_TEXT
+                                    && ops_[e + 1].y == y) ++e;
+    if (outStartOp)   *outStartOp   = s;
+    if (outStartChar) *outStartChar = 0;
+    if (outEndOp)     *outEndOp     = e;
+    if (outEndChar)   *outEndChar   = (int)ops_[e].text.size();
 }
 
 } // namespace md

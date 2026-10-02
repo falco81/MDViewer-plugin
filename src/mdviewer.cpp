@@ -66,6 +66,14 @@ struct PluginInst {
     int  selAnchorChar = 0;
     int  selCaretOp    = -1;
     int  selCaretChar  = 0;
+    // Word/line snap during drag: when a double- or triple-click
+    // starts a drag, we keep extending the selection by whole words
+    // (or whole lines) relative to a fixed anchor range.
+    int  dragGranularity = 0;      // 0 = char, 1 = word, 2 = line
+    int  anchorRangeStartOp   = -1;
+    int  anchorRangeStartChar = 0;
+    int  anchorRangeEndOp     = -1;
+    int  anchorRangeEndChar   = 0;
 
     std::wstring filePath;
 };
@@ -435,7 +443,7 @@ static void RegisterClassesOnce() {
     {
         WNDCLASSEXW wc = {};
         wc.cbSize        = sizeof(wc);
-        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
         wc.lpfnWndProc   = ViewerWndProc;
         wc.hInstance     = g_hInstance;
         wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
@@ -862,19 +870,10 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     break;
                 case 'A':
                     if (ctrl) {
-                        // Select all: from (0,0) to last text op, last char.
-                        std::wstring all = p->renderer.GetPlainText();
-                        // Set sentinel selection that covers entire document.
-                        // Use INT_MAX-1 as "last op" — the renderer clamps.
-                        p->renderer.SetSelection(0, 0, INT_MAX - 1, 0);
-                        // Better: walk to find a real last op.
-                        // Workaround: do a trick - use a hit test at the very
-                        // end-of-document Y to find the last op.
-                        int lastOp = 0, lastChar = 0;
-                        if (p->renderer.HitTestText(INT_MAX, p->contentH + 1000,
-                                                     &lastOp, &lastChar)) {
-                            p->renderer.SetSelection(0, 0, lastOp, INT_MAX);
-                        }
+                        // Dedicated SelectAll path — walks ops to find the
+                        // real first/last text ops instead of relying on
+                        // sentinel values. Works reliably on every file.
+                        p->renderer.SelectAll();
                         InvalidateRect(hwnd, nullptr, FALSE);
                         return 0;
                     }
@@ -1007,18 +1006,60 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             int op = -1, ch = 0;
             if (p->renderer.HitTestText(x, yDoc, &op, &ch)) {
-                p->selAnchorOp = op;
-                p->selAnchorChar = ch;
-                p->selCaretOp = op;
-                p->selCaretChar = ch;
-                p->renderer.SetSelection(op, ch, op, ch);
+                // Detect multi-click: within 500 ms of the previous
+                // click and within a few pixels of the previous
+                // position → treat as double / triple click.
+                static DWORD   lastClickTime = 0;
+                static POINT   lastClickPos  = { -9999, -9999 };
+                static int     clickCount    = 0;
+                DWORD now = GetTickCount();
+                int dx = x - lastClickPos.x;
+                int dy = y - lastClickPos.y;
+                bool close = (now - lastClickTime < GetDoubleClickTime())
+                          && (dx*dx + dy*dy <= 25);
+                clickCount = close ? (clickCount + 1) : 1;
+                if (clickCount > 3) clickCount = 1;
+                lastClickTime = now;
+                lastClickPos  = { x, y };
+
+                int aOp = op, aCh = ch, bOp = op, bCh = ch;
+                if (clickCount == 2) {
+                    p->renderer.ExpandToWord(op, ch, &aOp, &aCh, &bOp, &bCh);
+                    p->dragGranularity = 1;
+                } else if (clickCount == 3) {
+                    p->renderer.ExpandToLine(op, &aOp, &aCh, &bOp, &bCh);
+                    p->dragGranularity = 2;
+                } else {
+                    p->dragGranularity = 0;
+                }
+                p->selAnchorOp   = aOp;
+                p->selAnchorChar = aCh;
+                p->selCaretOp    = bOp;
+                p->selCaretChar  = bCh;
+                p->anchorRangeStartOp   = aOp;
+                p->anchorRangeStartChar = aCh;
+                p->anchorRangeEndOp     = bOp;
+                p->anchorRangeEndChar   = bCh;
+                p->renderer.SetSelection(aOp, aCh, bOp, bCh);
                 p->selecting = true;
                 SetCapture(hwnd);
-            } else {
-                p->renderer.ClearSelection();
             }
+            // When no text at all (empty doc), we simply ignore the
+            // click rather than clearing an existing selection — the
+            // user may want to Ctrl+C the previous selection even
+            // after accidentally clicking.
             InvalidateRect(hwnd, nullptr, FALSE);
             SetFocus(hwnd);
+            return 0;
+        }
+
+        case WM_LBUTTONDBLCLK: {
+            // Routed through WM_LBUTTONDOWN above by Windows when
+            // CS_DBLCLKS is set, but we also handle it explicitly in
+            // case the class style changes. The actual word-expansion
+            // happens in LBUTTONDOWN via the click-counter.
+            if (!p) break;
+            SendMessage(hwnd, WM_LBUTTONDOWN, wp, lp);
             return 0;
         }
 
@@ -1035,8 +1076,43 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (p->renderer.HitTestText(x, yDoc, &op, &ch)) {
                     p->selCaretOp = op;
                     p->selCaretChar = ch;
-                    p->renderer.SetSelection(p->selAnchorOp, p->selAnchorChar,
-                                              p->selCaretOp, p->selCaretChar);
+                    if (p->dragGranularity == 0) {
+                        p->renderer.SetSelection(
+                            p->selAnchorOp, p->selAnchorChar,
+                            p->selCaretOp,  p->selCaretChar);
+                    } else {
+                        // Word/line drag: snap each endpoint to a
+                        // word/line boundary and union with the
+                        // original anchor range.
+                        int sOp, sCh, eOp, eCh;
+                        if (p->dragGranularity == 1) {
+                            p->renderer.ExpandToWord(op, ch,
+                                &sOp, &sCh, &eOp, &eCh);
+                        } else {
+                            p->renderer.ExpandToLine(op,
+                                &sOp, &sCh, &eOp, &eCh);
+                        }
+                        // Union with the original anchor range.
+                        int aOp = p->anchorRangeStartOp;
+                        int aCh = p->anchorRangeStartChar;
+                        int bOp = p->anchorRangeEndOp;
+                        int bCh = p->anchorRangeEndChar;
+                        // final = min(start, aOp), max(end, bOp)
+                        auto less = [](int o1,int c1,int o2,int c2){
+                            if (o1 != o2) return o1 < o2;
+                            return c1 < c2;
+                        };
+                        int finalSOp = sOp, finalSCh = sCh;
+                        if (less(aOp, aCh, finalSOp, finalSCh)) {
+                            finalSOp = aOp; finalSCh = aCh;
+                        }
+                        int finalEOp = eOp, finalECh = eCh;
+                        if (less(finalEOp, finalECh, bOp, bCh)) {
+                            finalEOp = bOp; finalECh = bCh;
+                        }
+                        p->renderer.SetSelection(finalSOp, finalSCh,
+                                                  finalEOp, finalECh);
+                    }
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
@@ -1057,11 +1133,54 @@ static LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (p->selecting) {
                 p->selecting = false;
                 ReleaseCapture();
-                if (p->selAnchorOp == p->selCaretOp
+                // Only clear the selection if the mouse never moved —
+                // i.e. it was a plain single click on a character
+                // boundary rather than a drag. Word/line clicks (dbl /
+                // triple) should keep their expanded selection.
+                if (p->dragGranularity == 0
+                    && p->selAnchorOp == p->selCaretOp
                     && p->selAnchorChar == p->selCaretChar) {
                     p->renderer.ClearSelection();
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
+            }
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            // Context menu with Copy / Select All / Copy Link.
+            if (!p) break;
+            int x = GET_X_LPARAM(lp);
+            int y = GET_Y_LPARAM(lp);
+            std::wstring url = p->renderer.HitTestLink(x, y + p->scrollY);
+            HMENU menu = CreatePopupMenu();
+            bool hasSel = p->renderer.HasSelection();
+            AppendMenuW(menu, MF_STRING | (hasSel ? 0 : MF_GRAYED),
+                        1001, L"Copy\tCtrl+C");
+            AppendMenuW(menu, MF_STRING, 1002, L"Copy all\tCtrl+C");
+            AppendMenuW(menu, MF_STRING, 1003, L"Select all\tCtrl+A");
+            if (!url.empty()) {
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 1004, L"Copy link address");
+                AppendMenuW(menu, MF_STRING, 1005, L"Open link");
+            }
+            POINT scr = { x, y };
+            ClientToScreen(hwnd, &scr);
+            int cmd = TrackPopupMenu(menu,
+                TPM_LEFTALIGN | TPM_RETURNCMD, scr.x, scr.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+            if (cmd == 1001) {
+                CopyToClipboard(hwnd, p->renderer.GetSelectionText());
+            } else if (cmd == 1002) {
+                CopyToClipboard(hwnd, p->renderer.GetPlainText());
+            } else if (cmd == 1003) {
+                p->renderer.SelectAll();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (cmd == 1004 && !url.empty()) {
+                CopyToClipboard(hwnd, url);
+            } else if (cmd == 1005 && !url.empty()) {
+                ShellExecuteW(nullptr, L"open", url.c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
             }
             return 0;
         }
